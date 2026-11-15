@@ -1,5 +1,6 @@
 import { enableAccountSetup } from '@/features/profile/accountState';
 import { BackendError, requestBackend } from '@/infrastructure/backend/backendApi';
+import { ensureAnonymousAuth } from '@/infrastructure/firebase/firebaseAuth';
 
 type TwitchAuthorizationStart = {
   authorizationUrl: string;
@@ -37,6 +38,8 @@ export async function authorizeWithTwitch() {
   await enableAccountSetup();
 
   try {
+    await ensureAnonymousAuth({ replaceUnrestorable: true });
+
     const result = await requestBackend<TwitchAuthorizationStart>('/api/oauth/start', {
       method: 'POST',
     });
