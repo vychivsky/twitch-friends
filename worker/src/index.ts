@@ -215,6 +215,14 @@ async function handleOAuthCallback(request: Request, env: Env) {
   }
 }
 
+function decodePathSegment(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new ApiError(400, 'invalid-argument', 'Friend connection is invalid.');
+  }
+}
+
 async function handleApiRequest(request: Request, env: Env) {
   const identity = await verifyFirebaseIdentity(request, env);
   const url = new URL(request.url);
@@ -274,7 +282,7 @@ async function handleApiRequest(request: Request, env: Env) {
     await enforceRequestLimits(env.DB, 'friend-mutation', identity.uid, ip, 30, 90);
 
     const connectionId = validateConnectionId(
-      decodeURIComponent(path.slice('/api/friends/'.length)),
+      decodePathSegment(path.slice('/api/friends/'.length)),
     );
 
     await removeFriendConnection(env.DB, identity.uid, connectionId);
