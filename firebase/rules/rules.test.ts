@@ -149,4 +149,69 @@ describe('fail-closed Firebase rules', () => {
     await assertSucceeds(remove(ref(bob.database(), 'presence/bob')));
     await assertFails(remove(ref(alice.database(), 'presence/bob')));
   });
+
+  it('lets a sender remove its own record after the friendship is revoked', async () => {
+    await testEnvironment.withSecurityRulesDisabled(async (context) => {
+      await set(ref(context.database(), 'presence/bob/alice'), {
+        ciphertext: 'encryptedPayload',
+        expiresAt: Date.now() + 60_000,
+        iv: 'abcdefghijklmnop',
+        version: 1,
+      });
+    });
+
+    const alice = testEnvironment.authenticatedContext('alice');
+
+    await assertFails(
+      set(ref(alice.database(), 'presence/bob/alice'), {
+        ciphertext: 'encryptedPayload',
+        expiresAt: Date.now() + 60_000,
+        iv: 'abcdefghijklmnop',
+        version: 1,
+      }),
+    );
+    await assertSucceeds(remove(ref(alice.database(), 'presence/bob/alice')));
+  });
+
+  it('rejects expired, long-lived, and malformed presence records', async () => {
+    await testEnvironment.withSecurityRulesDisabled(async (context) => {
+      await set(ref(context.database(), 'friendships/alice/bob'), true);
+      await set(ref(context.database(), 'friendships/bob/alice'), true);
+    });
+
+    const reference = ref(
+      testEnvironment.authenticatedContext('alice').database(),
+      'presence/bob/alice',
+    );
+    const valid = {
+      ciphertext: 'encryptedPayload',
+      expiresAt: Date.now() + 60_000,
+      iv: 'abcdefghijklmnop',
+      version: 1,
+    };
+
+    await assertFails(set(reference, { ...valid, expiresAt: Date.now() - 1_000 }));
+    await assertFails(set(reference, { ...valid, expiresAt: Date.now() + 10 * 60_000 }));
+    await assertFails(set(reference, { ...valid, channel: 'plaintext' }));
+    await assertFails(set(reference, { ...valid, version: 2 }));
+    await assertSucceeds(set(reference, valid));
+  });
+
+  it('prevents recipients from forging records from their friends', async () => {
+    await testEnvironment.withSecurityRulesDisabled(async (context) => {
+      await set(ref(context.database(), 'friendships/alice/bob'), true);
+      await set(ref(context.database(), 'friendships/bob/alice'), true);
+    });
+
+    const bob = testEnvironment.authenticatedContext('bob');
+
+    await assertFails(
+      set(ref(bob.database(), 'presence/bob/alice'), {
+        ciphertext: 'encryptedPayload',
+        expiresAt: Date.now() + 60_000,
+        iv: 'abcdefghijklmnop',
+        version: 1,
+      }),
+    );
+  });
 });

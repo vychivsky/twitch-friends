@@ -1,5 +1,7 @@
 # Security Architecture
 
+> Implementation status: the base trust boundaries and encryption model are implemented. Protected session persistence (PR #2), scoped friendship queries (PR #3), local recipient/key caches, persisted tab tracking, retry backoff, and alarm heartbeats below describe pending changes, not guarantees of current `main`. The comment-policy release gate is not configured in `main`.
+
 ## Objectives
 
 - Keep Twitch and backend credentials out of the extension bundle.
@@ -31,6 +33,9 @@
 | --------------------------- | -------------------------------- | ------------------------------- |
 | Private ECDH key            | Extension IndexedDB              | Until Delete my data            |
 | Local settings and UI cache | Extension local storage          | Until disconnect or deletion    |
+| Friend IDs and public keys  | Extension local storage (cache)  | Until disconnect or deletion    |
+| Open-tab channel logins     | Extension session storage        | Tab close or browser exit       |
+| Firebase refresh token      | Extension IndexedDB (SDK)        | Until Delete my data            |
 | Privacy consent version     | Extension local storage          | Until deletion or policy update |
 | Firebase installation UID   | Firebase Authentication          | Until Delete my data            |
 | Twitch profile mapping      | Cloudflare D1                    | Until disconnect or deletion    |
@@ -85,8 +90,12 @@ valid Firebase bearer token. Users can read only their own profile, requests, an
 mutations are derived from the authenticated UID rather than a client-supplied owner ID.
 
 D1 is the only friendship source of truth. Clients cannot write the Realtime Database friendship
-cache. The Worker synchronizes affected nodes after mutations and presence refreshes, and its daily
-reconciliation replaces the complete cache so unknown or stale edges are removed. Both D1 checks and
+cache. The current Worker loads the full friendship graph for request-time synchronization.
+The pending scoped-synchronization change (PR #3) synchronizes only the affected nodes, using an indexed query
+that loads just the friendships of those users. A presence-friends request heals the caller's own
+node in the background with `waitUntil`. The daily reconciliation replaces the complete cache, so
+unknown or stale edges are removed. OAuth reconnects also replace the complete cache, because they
+can move a Twitch account to a new UID. Both D1 checks and
 a database trigger cap accepted friendships at 100 per account.
 
 Database uniqueness constraints prevent one Twitch account, login, or Firebase UID from owning
@@ -104,9 +113,24 @@ Realtime Database rules require reciprocal friendship edges before a sender can 
 mailbox. A recipient may read and clear only their own mailbox. A sender may delete only their own
 outbound records. All other paths deny reads and writes.
 
-The client refreshes active presence every 30 seconds, applies a three-second publish debounce, and
-uses the short encrypted expiry to tolerate Manifest V3 service-worker suspension. Explicit account
-and channel cleanup removes active records. It never persists plaintext viewing history.
+The following is the pending presence design, not current `main` behavior (which delays a channel
+publish by three seconds and uses background timers rather than alarms).
+A channel change is published immediately. Only one publish pass runs at a time, and the newest
+selection always wins. Records are refreshed when they are 25 seconds old and expire after 60
+seconds. Failed writes stay unconfirmed and are retried with backoff. A heartbeat alarm and
+memory-only `storage.session` state let a restarted service worker resume or clean up without
+plaintext viewing history ever reaching disk. When no tab is on a channel, the sender removes its
+records after a three-second grace period. Rules allow a sender to delete its own records even
+after the friendship has ended.
+
+## Sessions
+
+The following describes the pending session-persistence change in PR #2.
+Only the background creates anonymous Firebase users. The Firebase credential is stored in the
+extension's IndexedDB through a persistence guard. The guard prevents the SDK from deleting the
+credential after transient restore errors. A credential that cannot be restored is replaced only
+when the user explicitly connects Twitch again, which repeats the OAuth ownership proof. See
+[session-persistence.md](session-persistence.md).
 
 ## API controls
 
@@ -147,9 +171,21 @@ Firebase UID and private key remain available for a later reconnect.
 extension storage, and deletes the identity IndexedDB database. A local setup-required flag prevents
 a replacement anonymous account from being created until the user explicitly connects again.
 
+## Known cryptographic limitations
+
+- Both directions of a friendship derive the same AES key, and the ciphertext does not bind the
+  sender and recipient as associated data. A malicious database operator could reflect a record from
+  one direction into the other inbox within its 60-second lifetime. Friends can already claim any
+  channel for themselves, so this gives no extra capability to users. Binding direction needs a
+  versioned protocol change (version 2) with a coordinated Rules release.
+- Expired ciphertext can remain in Realtime Database after a crash. Clients reject expired records,
+  but expiry does not make saved ciphertext cryptographically undecryptable. The next publish or
+  removal by the sender overwrites it.
+
 ## Release gates
 
-- Formatting, lint, TypeScript, unit tests, Worker tests, and Firebase Rules tests must pass.
+- Formatting, lint, TypeScript, unit tests, Worker tests, and Firebase Rules
+  tests must pass.
 - Chrome and Firefox production builds must complete.
 - The Worker dry-run bundle must complete without configuration warnings.
 - Production dependencies must have no known high or critical vulnerabilities.
