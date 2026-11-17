@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { decryptPresence, encryptPresence } from '@/features/presence/presenceCrypto';
 import type { LocalIdentity, PublicIdentityKey } from '@/security/identity/localIdentityTypes';
@@ -74,5 +74,56 @@ describe('presence encryption', () => {
         expiresAt: Date.now() - 1,
       }),
     ).resolves.toBe(null);
+  });
+});
+
+const channel = { login: 'stream', url: 'https://www.twitch.tv/stream' };
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('presence key caching', () => {
+  it('shares key derivation across concurrent writes while using fresh IVs', async () => {
+    const [alice, bob] = await Promise.all([createIdentity(), createIdentity()]);
+    const derive = vi.spyOn(crypto.subtle, 'deriveKey');
+    const [first, second] = await Promise.all([
+      encryptPresence(alice, bob.encryptionPublicKey, channel),
+      encryptPresence(alice, bob.encryptionPublicKey, channel),
+    ]);
+
+    expect(derive).toHaveBeenCalledOnce();
+    expect(first.iv).not.toBe(second.iv);
+    expect(await decryptPresence(bob, alice.encryptionPublicKey, first)).toEqual(channel);
+    expect(await decryptPresence(bob, alice.encryptionPublicKey, second)).toEqual(channel);
+  });
+
+  it('isolates cached keys by sender private key and recipient public key', async () => {
+    const [alice, bob, charlie] = await Promise.all([
+      createIdentity(),
+      createIdentity(),
+      createIdentity(),
+    ]);
+    const derive = vi.spyOn(crypto.subtle, 'deriveKey');
+
+    await encryptPresence(alice, bob.encryptionPublicKey, channel);
+    await encryptPresence(alice, charlie.encryptionPublicKey, channel);
+    await encryptPresence(charlie, bob.encryptionPublicKey, channel);
+
+    expect(derive).toHaveBeenCalledTimes(3);
+  });
+
+  it('rejects expired or tampered records even when the derived key is cached', async () => {
+    const [alice, bob] = await Promise.all([createIdentity(), createIdentity()]);
+    const record = await encryptPresence(alice, bob.encryptionPublicKey, channel);
+
+    expect(await decryptPresence(bob, alice.encryptionPublicKey, record)).toEqual(channel);
+    expect(
+      await decryptPresence(bob, alice.encryptionPublicKey, { ...record, expiresAt: 0 }),
+    ).toBeNull();
+    expect(
+      await decryptPresence(bob, alice.encryptionPublicKey, {
+        ...record,
+        ciphertext: 'a'.repeat(record.ciphertext.length),
+      }),
+    ).toBeNull();
   });
 });

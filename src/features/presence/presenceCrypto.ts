@@ -8,7 +8,11 @@ export type EncryptedPresence = {
   version: 1;
 };
 
-const presenceLifetime = 60_000;
+export const presenceLifetime = 60_000;
+
+const maximumCachedKeys = 256;
+
+const derivedKeyCache = new WeakMap<CryptoKey, Map<string, Promise<CryptoKey>>>();
 
 function toBase64Url(bytes: Uint8Array) {
   let value = '';
@@ -35,7 +39,37 @@ function fromBase64Url(value: string) {
   return bytes;
 }
 
-async function derivePresenceKey(identity: LocalIdentity, publicKey: PublicIdentityKey) {
+function derivePresenceKey(identity: LocalIdentity, publicKey: PublicIdentityKey) {
+  let identityCache = derivedKeyCache.get(identity.encryptionPrivateKey);
+
+  if (!identityCache) {
+    identityCache = new Map();
+    derivedKeyCache.set(identity.encryptionPrivateKey, identityCache);
+  }
+
+  const cacheKey = `${publicKey.x}.${publicKey.y}`;
+  const cached = identityCache.get(cacheKey);
+
+  if (cached) {
+    return cached;
+  }
+
+  if (identityCache.size >= maximumCachedKeys) {
+    identityCache.clear();
+  }
+
+  const cache = identityCache;
+  const derived = deriveUncachedPresenceKey(identity, publicKey).catch((cause: unknown) => {
+    cache.delete(cacheKey);
+    throw cause;
+  });
+
+  cache.set(cacheKey, derived);
+
+  return derived;
+}
+
+async function deriveUncachedPresenceKey(identity: LocalIdentity, publicKey: PublicIdentityKey) {
   const recipientKey = await crypto.subtle.importKey(
     'jwk',
     publicKey,

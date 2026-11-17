@@ -1,17 +1,15 @@
 import { getFirebaseEnvironment } from '@/config/firebaseEnvironment';
-import { LOCAL_FRIENDS_KEY } from '@/features/friends/localFriends';
 import { ACTIVE_TAB_STATE_KEY } from '@/features/presence/activeTabState';
 import { PresenceTabTracker } from '@/features/presence/presenceTabTracker';
+import { isActiveChannelRequest, isActiveChannelUpdate } from '@/features/presence/twitchChannel';
 import {
-  isActiveChannelRequest,
-  isActiveChannelUpdate,
-  type TwitchChannel,
-} from '@/features/presence/twitchChannel';
-import {
-  refreshPresenceHeartbeat,
+  ensurePresenceFresh,
+  getPresenceUid,
+  invalidatePresenceRegistration,
+  isPresenceStarted,
   refreshPresenceFriends,
   startPresenceSync,
-  updatePresenceChannel,
+  setPresenceChannel,
 } from '@/features/presence/presenceSync';
 import { isPresenceFriendsRefreshMessage } from '@/features/presence/presenceMessages';
 import {
@@ -19,10 +17,8 @@ import {
   isPrivacyConsentAcceptedMessage,
 } from '@/features/privacy/privacyConsent';
 import { isAccountSetupRequired } from '@/features/profile/accountState';
-import {
-  getMyTwitchProfile,
-  isTwitchProfileConnectedMessage,
-} from '@/features/profile/myTwitchProfile';
+import { isTwitchProfileConnectedMessage } from '@/features/profile/myTwitchProfile';
+import { BackendError } from '@/infrastructure/backend/backendApi';
 import { ensureAnonymousAuth } from '@/infrastructure/firebase/firebaseAuth';
 import {
   getRuntimeStatus,
@@ -32,9 +28,10 @@ import {
 import { getOrCreateLocalIdentity } from '@/security/identity/localIdentity';
 import { browser } from 'wxt/browser';
 
-let activeChannel: TwitchChannel | null = null;
-let presenceStarted = false;
-let presenceStartPromise: Promise<void> | null = null;
+let initializePromise: Promise<void> | null = null;
+let presenceStartAttemptAt = 0;
+let presenceStartBlocked = false;
+const presenceStartRetryInterval = 60_000;
 let restoreTabState = Promise.resolve();
 const TAB_TRACKER_ALARM = 'presence-tab-tracker';
 
@@ -44,7 +41,8 @@ function reportPresenceError(action: string, cause: unknown) {
   console.error(`[Twitch Friends] ${action}: ${message}`);
 }
 
-async function initializeBackground() {
+async function runInitialization() {
+  presenceStartAttemptAt = Date.now();
   try {
     const environment = getFirebaseEnvironment();
 
@@ -58,6 +56,7 @@ async function initializeBackground() {
   }
 
   if (!(await isPrivacyConsentAccepted())) {
+    presenceStartBlocked = true;
     setRuntimeStatus({
       firebaseAuth: 'inactive',
       localIdentity: 'inactive',
@@ -73,6 +72,7 @@ async function initializeBackground() {
   });
 
   if (await isAccountSetupRequired()) {
+    presenceStartBlocked = true;
     setRuntimeStatus({
       firebaseAuth: 'inactive',
       localIdentity: 'inactive',
@@ -111,31 +111,54 @@ async function initializeBackground() {
   await startPresenceIfConnected();
 }
 
-function startPresenceIfConnected() {
-  if (presenceStarted) {
-    return Promise.resolve();
-  }
-
-  presenceStartPromise ??= (async () => {
-    try {
-      await restoreTabState;
-      const profile = await getMyTwitchProfile();
-
-      if (!profile) {
-        return;
-      }
-
-      await startPresenceSync(activeChannel);
-      presenceStarted = true;
-    } catch (cause) {
-      reportPresenceError('Presence could not start', cause);
-      return;
-    }
-  })().finally(() => {
-    presenceStartPromise = null;
+function initializeBackground() {
+  presenceStartBlocked = false;
+  initializePromise ??= runInitialization().finally(() => {
+    initializePromise = null;
   });
 
-  return presenceStartPromise;
+  return initializePromise;
+}
+
+async function startPresenceIfConnected() {
+  try {
+    await restoreTabState;
+    await startPresenceSync();
+  } catch (cause) {
+    if (cause instanceof BackendError && cause.code === 'failed-precondition') {
+      presenceStartBlocked = true;
+      return;
+    }
+
+    reportPresenceError('Presence could not start', cause);
+  }
+}
+
+function retryPresenceStart() {
+  if (
+    isPresenceStarted() ||
+    presenceStartBlocked ||
+    initializePromise ||
+    Date.now() - presenceStartAttemptAt < presenceStartRetryInterval
+  ) {
+    return;
+  }
+
+  void initializeBackground().catch((cause: unknown) =>
+    reportPresenceError('Presence initialization failed', cause),
+  );
+}
+
+async function handleTwitchProfileConnected() {
+  await invalidatePresenceRegistration();
+  const presenceUid = getPresenceUid();
+
+  if (presenceUid !== null && (await ensureAnonymousAuth()) !== presenceUid) {
+    browser.runtime.reload();
+    return;
+  }
+
+  await initializeBackground();
 }
 export default defineBackground(() => {
   let alarmUpdate = Promise.resolve();
@@ -159,8 +182,7 @@ export default defineBackground(() => {
     now: () => Date.now(),
     onError: reportPresenceError,
     onSelectionChange: (selection) => {
-      activeChannel = selection?.channel ?? null;
-      updatePresenceChannel(activeChannel);
+      setPresenceChannel(selection?.channel ?? null);
       alarmUpdate = alarmUpdate
         .then(async () => {
           if (selection) {
@@ -175,7 +197,7 @@ export default defineBackground(() => {
           reportPresenceError('Tab tracker alarm could not update', cause),
         );
     },
-    onUnchanged: () => refreshPresenceHeartbeat(),
+    onUnchanged: () => ensurePresenceFresh(),
     saveState: (state) => browser.storage.session.set({ [ACTIVE_TAB_STATE_KEY]: state }),
     tabExists: async (tabId) => {
       try {
@@ -205,6 +227,7 @@ export default defineBackground(() => {
         tabId: sender.tab.id,
         windowId: sender.tab.windowId,
       });
+      retryPresenceStart();
     } else if (isActiveChannelRequest(message)) {
       void tracker.getSelection().then((selection) => sendResponse(selection?.channel ?? null));
       return true;
@@ -213,7 +236,9 @@ export default defineBackground(() => {
     } else if (isPrivacyConsentAcceptedMessage(message)) {
       void initializeBackground();
     } else if (isTwitchProfileConnectedMessage(message)) {
-      void startPresenceIfConnected();
+      void handleTwitchProfileConnected().catch((cause: unknown) =>
+        reportPresenceError('Connected profile could not initialize', cause),
+      );
     } else if (isPresenceFriendsRefreshMessage(message)) {
       void refreshPresenceFriends().catch((cause: unknown) => {
         reportPresenceError('Friends presence could not refresh', cause);
@@ -221,14 +246,6 @@ export default defineBackground(() => {
     }
 
     return false;
-  });
-
-  browser.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName === 'local' && changes[LOCAL_FRIENDS_KEY]) {
-      void refreshPresenceFriends().catch((cause: unknown) => {
-        reportPresenceError('Friends presence could not refresh', cause);
-      });
-    }
   });
 
   browser.tabs.onActivated.addListener(({ tabId, windowId }) => {
@@ -250,6 +267,7 @@ export default defineBackground(() => {
   browser.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === TAB_TRACKER_ALARM) {
       void tracker.heartbeat();
+      retryPresenceStart();
     }
   });
 
