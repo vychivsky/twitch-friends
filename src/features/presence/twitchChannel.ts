@@ -100,18 +100,26 @@ export function isTwitchChannel(value: unknown): value is TwitchChannel {
   );
 }
 
-export function isActiveChannelUpdate(
-  value: unknown,
-): value is { channel: TwitchChannel | null; type: typeof ACTIVE_CHANNEL_UPDATE } {
+export type ActiveChannelUpdate = {
+  channel: TwitchChannel | null;
+  detectedAt?: number;
+  type: typeof ACTIVE_CHANNEL_UPDATE;
+};
+
+export function isActiveChannelUpdate(value: unknown): value is ActiveChannelUpdate {
   if (!value || typeof value !== 'object') {
     return false;
   }
 
   const message = value as Record<string, unknown>;
+  const keys = Object.keys(message);
+  const hasDetectedAt = 'detectedAt' in message;
 
   return (
-    Object.keys(message).length === 2 &&
+    keys.length === (hasDetectedAt ? 3 : 2) &&
     message.type === ACTIVE_CHANNEL_UPDATE &&
+    (!hasDetectedAt ||
+      (typeof message.detectedAt === 'number' && Number.isSafeInteger(message.detectedAt))) &&
     (message.channel === null || isTwitchChannel(message.channel))
   );
 }
