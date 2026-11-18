@@ -50,15 +50,9 @@ export function Sidebar() {
     };
 
     browser.storage.onChanged.addListener(handleStorageChange);
-    const interval = window.setInterval(() => {
-      setPresence((currentPresence) =>
-        currentPresence.filter((item) => item.expiresAt > Date.now()),
-      );
-    }, 5_000);
 
     return () => {
       active = false;
-      window.clearInterval(interval);
 
       try {
         browser.storage.onChanged.removeListener(handleStorageChange);
@@ -67,6 +61,26 @@ export function Sidebar() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (presence.length === 0) {
+      return;
+    }
+
+    const earliestExpiry = Math.min(...presence.map((item) => item.expiresAt));
+    const timeout = window.setTimeout(
+      () => {
+        setPresence((currentPresence) =>
+          currentPresence.filter((item) => item.expiresAt > Date.now()),
+        );
+      },
+      Math.max(0, earliestExpiry - Date.now() + 50),
+    );
+
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [presence]);
 
   return (
     <section className="friends-section" role="group" aria-label="Friends">
