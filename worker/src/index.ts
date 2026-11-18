@@ -216,6 +216,14 @@ async function handleOAuthCallback(request: Request, env: Env) {
   }
 }
 
+function decodePathSegment(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new ApiError(400, 'invalid-argument', 'Friend connection is invalid.');
+  }
+}
+
 async function syncAffectedFriendships(env: Env, affectedUids: string[]) {
   await syncFriendshipNodes(
     env,
@@ -280,7 +288,7 @@ async function handleApiRequest(request: Request, env: Env, context: ExecutionCo
     await enforceRequestLimits(env.DB, 'friend-mutation', identity.uid, ip, 30, 90);
 
     const connectionId = validateConnectionId(
-      decodeURIComponent(path.slice('/api/friends/'.length)),
+      decodePathSegment(path.slice('/api/friends/'.length)),
     );
 
     await removeFriendConnection(env.DB, identity.uid, connectionId);
