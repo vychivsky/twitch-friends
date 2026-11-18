@@ -409,6 +409,42 @@ export async function listFriendshipEdges(database: D1Database): Promise<Friends
   }));
 }
 
+export async function listFriendshipEdgesForUids(
+  database: D1Database,
+  firebaseUids: string[],
+): Promise<FriendshipEdge[]> {
+  const uids = [...new Set(firebaseUids.filter(Boolean))];
+
+  if (uids.length === 0) {
+    return [];
+  }
+
+  const result = await database
+    .prepare(
+      `WITH target_users AS (
+         SELECT twitch_id
+         FROM users
+         WHERE firebase_uid IN (SELECT value FROM json_each(?))
+       )
+       SELECT
+         user_a.firebase_uid AS user_a_uid,
+         user_b.firebase_uid AS user_b_uid
+       FROM friendships
+       JOIN users AS user_a ON user_a.twitch_id = friendships.user_a
+       JOIN users AS user_b ON user_b.twitch_id = friendships.user_b
+       WHERE friendships.user_a IN (SELECT twitch_id FROM target_users)
+          OR friendships.user_b IN (SELECT twitch_id FROM target_users)
+       ORDER BY friendships.user_a, friendships.user_b`,
+    )
+    .bind(JSON.stringify(uids))
+    .all<{ user_a_uid: string; user_b_uid: string }>();
+
+  return result.results.map((row) => ({
+    userAUid: row.user_a_uid,
+    userBUid: row.user_b_uid,
+  }));
+}
+
 export async function removeFriendConnection(
   database: D1Database,
   firebaseUid: string,

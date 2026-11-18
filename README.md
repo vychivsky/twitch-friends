@@ -6,6 +6,17 @@ share which live channel they are watching without collecting viewing history.
 The project is being prepared for a closed beta. Friend requests, encrypted presence, Twitch OAuth
 ownership verification, account cleanup, and the Twitch sidebar integration are working.
 
+## Documentation
+
+- [Security architecture](docs/security-architecture.md): trust boundaries, storage, access controls,
+  and cryptographic limitations. Pending changes are explicitly identified.
+- [Session persistence design](docs/session-persistence.md): proposed session recovery and its limits.
+- [Presence design](docs/presence-design.md): target architecture and channel-switch sequence diagrams.
+- [Roadmap](docs/roadmap.md): planned releases, not current functionality.
+
+The session and presence improvements described in the design documents are not yet merged into
+`main`. The current behavior is summarized below; merging documentation does not deploy those fixes.
+
 ## Current state
 
 - Chrome Manifest V3 and Firefox builds
@@ -24,12 +35,43 @@ ownership verification, account cleanup, and the Twitch sidebar integration are 
 
 ## Architecture
 
+```mermaid
+flowchart LR
+  Page["Twitch page"] --- Content["Content script: detection and sidebar"]
+  Content -- "channel messages" --> Background["Extension background"]
+  Popup["Popup: profile and friends"] --> API["Cloudflare Worker API"]
+  Background -- "Firebase ID token" --> API
+  API --- D1[("D1: profiles, friendships, public keys")]
+  API -- "OAuth and Helix" --> Twitch["Twitch API"]
+  API -- "server-managed friendship cache" --> RTDB[("Realtime Database")]
+  Background -- "per-friend encrypted presence" --> RTDB
+  Background --- Auth["Firebase Anonymous Authentication"]
+  Background --- Keys[("Extension IndexedDB: private identity key")]
+  Background -- "display state" --> Storage[("Extension local storage")]
+  Storage --> Content
+```
+
 The extension never receives a Twitch client secret, authorization code, access token, or refresh
 token. Twitch OAuth and Helix requests run in a Cloudflare Worker. D1 stores account and friendship
 metadata. Realtime Database carries only recipient-specific encrypted presence with a short expiry.
 The matching private key remains in extension-owned IndexedDB.
 
 See [docs/security-architecture.md](docs/security-architecture.md) for the full security model.
+
+### Current timing and limits
+
+These are configured values, not measured latency guarantees.
+
+| Setting                             | Current value in `main`                    |
+| ----------------------------------- | ------------------------------------------ |
+| Channel-change publish delay        | 3 seconds                                  |
+| Content-script channel announcement | 10 seconds                                 |
+| Presence heartbeat timer            | 30 seconds while the background is running |
+| Presence record lifetime            | 60 seconds; clients ignore expired records |
+| Friend limit                        | 100 accepted friends                       |
+
+Service-worker suspension and network conditions can delay updates. Immediate publishing, durable
+tab tracking, retries, and alarm-driven heartbeats remain pending presence work.
 
 ## Development
 
@@ -45,14 +87,15 @@ Add the local Twitch client credentials only to `.dev.vars`; both local files ar
 Start the local services in separate terminals:
 
 ```bash
-npm install
+npm ci
 npm run firebase:emulators
+npm run worker:migrate:local
 npm run worker:dev
 npm run dev
 ```
 
 Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select
-`.output/chrome-mv3`.
+`.output/chrome-mv3-dev` for development, or `.output/chrome-mv3` after `npm run build`.
 
 ## Commands
 
@@ -82,7 +125,8 @@ Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and
 - Twitch tokens are revoked after ownership verification and are never persisted.
 - Private identity keys are generated and stored locally.
 - Presence is encrypted separately for every accepted friend.
-- Presence records expire after one minute and are not retained as history.
+- Clients ignore presence after one minute. Expired ciphertext can remain in Firebase until cleanup;
+  expiry is not cryptographic erasure and does not prevent a key holder from decrypting saved data.
 - **Disconnect Twitch** removes the profile, friendships, requests, public key, and presence.
 - **Delete my data** also deletes the Firebase identity and local extension data.
 
