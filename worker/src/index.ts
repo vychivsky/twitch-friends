@@ -21,6 +21,7 @@ import {
   getPresenceFriends,
   getProfileByFirebaseUid,
   listFriendshipEdges,
+  listFriendshipEdgesForUids,
   removeAccount,
   removeFriendConnection,
   respondToFriendRequest,
@@ -223,7 +224,15 @@ function decodePathSegment(value: string) {
   }
 }
 
-async function handleApiRequest(request: Request, env: Env) {
+async function syncAffectedFriendships(env: Env, affectedUids: string[]) {
+  await syncFriendshipNodes(
+    env,
+    await listFriendshipEdgesForUids(env.DB, affectedUids),
+    affectedUids,
+  );
+}
+
+async function handleApiRequest(request: Request, env: Env, context: ExecutionContext) {
   const identity = await verifyFirebaseIdentity(request, env);
   const url = new URL(request.url);
   const path = url.pathname;
@@ -270,10 +279,7 @@ async function handleApiRequest(request: Request, env: Env) {
     await respondToFriendRequest(env.DB, identity.uid, connectionId, input.accept);
 
     if (input.accept) {
-      await syncFriendshipNodes(env, await listFriendshipEdges(env.DB), [
-        identity.uid,
-        connectionId,
-      ]);
+      await syncAffectedFriendships(env, [identity.uid, connectionId]);
     }
     return json({ success: true });
   }
@@ -286,7 +292,7 @@ async function handleApiRequest(request: Request, env: Env) {
     );
 
     await removeFriendConnection(env.DB, identity.uid, connectionId);
-    await syncFriendshipNodes(env, await listFriendshipEdges(env.DB), [identity.uid, connectionId]);
+    await syncAffectedFriendships(env, [identity.uid, connectionId]);
     return json({ success: true });
   }
 
@@ -302,26 +308,23 @@ async function handleApiRequest(request: Request, env: Env) {
 
   if (path === '/api/presence-friends' && request.method === 'GET') {
     await enforceRequestLimits(env.DB, 'presence-friends', identity.uid, ip, 30, 90);
-    const [presenceFriends, friendshipEdges] = await Promise.all([
-      getPresenceFriends(env.DB, identity.uid),
-      listFriendshipEdges(env.DB),
-    ]);
+    const presenceFriends = await getPresenceFriends(env.DB, identity.uid);
 
-    await syncFriendshipNodes(env, friendshipEdges, [identity.uid]);
+    context.waitUntil(syncAffectedFriendships(env, [identity.uid]).catch(() => undefined));
     return json(presenceFriends);
   }
 
   if (path === '/api/account/disconnect' && request.method === 'POST') {
     await enforceRequestLimits(env.DB, 'account-mutation', identity.uid, ip, 3, 10);
     const friendIds = await removeAccount(env.DB, identity.uid);
-    await syncFriendshipNodes(env, await listFriendshipEdges(env.DB), [identity.uid, ...friendIds]);
+    await syncAffectedFriendships(env, [identity.uid, ...friendIds]);
     return json({ friendIds, success: true });
   }
 
   if (path === '/api/account' && request.method === 'DELETE') {
     await enforceRequestLimits(env.DB, 'account-mutation', identity.uid, ip, 3, 10);
     const friendIds = await removeAccount(env.DB, identity.uid);
-    await syncFriendshipNodes(env, await listFriendshipEdges(env.DB), [identity.uid, ...friendIds]);
+    await syncAffectedFriendships(env, [identity.uid, ...friendIds]);
     return json({ friendIds, success: true });
   }
 
@@ -336,7 +339,7 @@ export default {
     ]);
   },
 
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, context: ExecutionContext): Promise<Response> {
     try {
       const url = new URL(request.url);
       const legalResponse = await handleLegalRequest(request, env.ASSETS);
@@ -367,7 +370,7 @@ export default {
         return withCors(new Response(null, { status: 204 }), origin);
       }
 
-      return withCors(await handleApiRequest(request, env), origin);
+      return withCors(await handleApiRequest(request, env, context), origin);
     } catch (cause) {
       const origin = getAllowedRequestOrigin(request, env);
       const response = errorResponse(cause);
