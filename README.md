@@ -9,13 +9,13 @@ ownership verification, account cleanup, and the Twitch sidebar integration are 
 ## Documentation
 
 - [Security architecture](docs/security-architecture.md): trust boundaries, storage, access controls,
-  and cryptographic limitations. Pending changes are explicitly identified.
-- [Session persistence design](docs/session-persistence.md): proposed session recovery and its limits.
-- [Presence design](docs/presence-design.md): target architecture and channel-switch sequence diagrams.
+  and cryptographic limitations.
+- [Session persistence](docs/session-persistence.md): credential recovery and its limits.
+- [Presence design](docs/presence-design.md): architecture and channel-switch sequence diagrams.
 - [Roadmap](docs/roadmap.md): planned releases, not current functionality.
 
-The session and presence improvements described in the design documents are not yet merged into
-`main`. The current behavior is summarized below; merging documentation does not deploy those fixes.
+The current implementation is summarized below. Automated tests and builds do not replace manual
+two-user browser testing or deploy the Worker and extension to production.
 
 ## Current state
 
@@ -62,16 +62,18 @@ See [docs/security-architecture.md](docs/security-architecture.md) for the full 
 
 These are configured values, not measured latency guarantees.
 
-| Setting                             | Current value in `main`                    |
-| ----------------------------------- | ------------------------------------------ |
-| Channel-change publish delay        | 3 seconds                                  |
-| Content-script channel announcement | 10 seconds                                 |
-| Presence heartbeat timer            | 30 seconds while the background is running |
-| Presence record lifetime            | 60 seconds; clients ignore expired records |
-| Friend limit                        | 100 accepted friends                       |
+| Setting                             | Current value in `main`                       |
+| ----------------------------------- | --------------------------------------------- |
+| Channel-change publish delay        | No debounce; starts when recipients are ready |
+| Content-script channel announcement | 10 seconds                                    |
+| Presence heartbeat                  | 25-second refresh threshold; 30-second alarm  |
+| Presence record lifetime            | 60 seconds; clients ignore expired records    |
+| Friend limit                        | 100 accepted friends                          |
 
-Service-worker suspension and network conditions can delay updates. Immediate publishing, durable
-tab tracking, retries, and alarm-driven heartbeats remain pending presence work.
+Service-worker suspension and network conditions can delay updates. Tab state is restored from
+`storage.session` across service-worker restarts, not browser restarts. Writes use retries and
+timeouts; neither retries nor alarms guarantee instant delivery. A timeout does not cancel an
+already-issued Firebase write.
 
 ## Development
 
@@ -132,12 +134,13 @@ Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and
 
 ## Permissions
 
-| Permission                                                | Reason                            |
-| --------------------------------------------------------- | --------------------------------- |
-| `storage`                                                 | Store extension-owned settings    |
-| `https://www.twitch.tv/*`                                 | Add the friends section on Twitch |
-| `http://127.0.0.1/*` (development builds only)            | Reach local emulators and Worker  |
-| `https://twitch-friends-api.yuravychivskii.workers.dev/*` | Reach the production API          |
+| Permission                                                | Reason                                     |
+| --------------------------------------------------------- | ------------------------------------------ |
+| `storage`                                                 | Store extension-owned settings             |
+| `alarms`                                                  | Maintain active-tab and presence freshness |
+| `https://www.twitch.tv/*`                                 | Add the friends section on Twitch          |
+| `http://127.0.0.1/*` (development builds only)            | Reach local emulators and Worker           |
+| `https://twitch-friends-api.yuravychivskii.workers.dev/*` | Reach the production API                   |
 
 ## Production
 

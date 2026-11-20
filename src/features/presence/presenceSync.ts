@@ -1,49 +1,159 @@
 import { onValue, ref, remove, set, type Unsubscribe } from 'firebase/database';
+import { browser } from 'wxt/browser';
 
-import { normalizeTwitchLogin } from '@/features/presence/twitchChannel';
+import { saveFriendPresence } from '@/features/presence/friendPresence';
 import {
   decryptPresence,
   encryptPresence,
-  type EncryptedPresence,
+  presenceLifetime,
 } from '@/features/presence/presenceCrypto';
-import { saveFriendPresence, type FriendPresence } from '@/features/presence/friendPresence';
-import { isPresenceHeartbeatDue } from '@/features/presence/presenceHeartbeat';
-import { type TwitchChannel } from '@/features/presence/twitchChannel';
+import { presenceWriteTimeout } from '@/features/presence/presenceHeartbeat';
+import { PresencePublisher, type PresenceRecipient } from '@/features/presence/presencePublisher';
+import { PresenceReceiver } from '@/features/presence/presenceReceiver';
+import { normalizeTwitchLogin, type TwitchChannel } from '@/features/presence/twitchChannel';
 import { requestBackend } from '@/infrastructure/backend/backendApi';
 import { ensureAnonymousAuth } from '@/infrastructure/firebase/firebaseAuth';
 import { getFirebaseDatabase } from '@/infrastructure/firebase/firebaseDatabase';
+import { logPresenceTiming } from '@/runtime/devTiming';
 import { getOrCreateLocalIdentity } from '@/security/identity/localIdentity';
 import type { LocalIdentity, PublicIdentityKey } from '@/security/identity/localIdentityTypes';
 
-type PresenceFriend = {
-  encryptionKey: PublicIdentityKey;
-  id: string;
-  login: string;
+type FriendsCache = {
+  fetchedAt: number;
+  friendshipKey: string | null;
+  items: PresenceRecipient[];
+  uid: string;
+  version: 1;
 };
 
-let activeChannel: TwitchChannel | null = null;
-let friends: PresenceFriend[] = [];
-let identity: LocalIdentity | null = null;
-let lastPresencePublishAt = 0;
-let presenceExpiryTimer: ReturnType<typeof setTimeout> | null = null;
-let presencePublishTimer: ReturnType<typeof setTimeout> | null = null;
-let publishedRecipients = new Set<string>();
-let presenceRevision = 0;
-let publishQueue = Promise.resolve();
-let refreshPromise: Promise<void> | null = null;
-let timersStarted = false;
-let unsubscribePresence: Unsubscribe | null = null;
-let uid = '';
+export const PRESENCE_FRIENDS_CACHE_KEY = 'presence-friends-cache';
+export const PRESENCE_REGISTRATION_KEY = 'presence-identity-registration';
+export const PUBLISHED_RECIPIENTS_KEY = 'presence-published-recipients';
 
-const presencePublishInterval = 30_000;
-const presencePublishDelay = 3_000;
-const presenceServiceRefreshInterval = 45 * 60_000;
+const friendsCacheMaxAge = 30 * 60_000;
+const friendsRefreshRetryInterval = 5 * 60_000;
+const registrationMaxAge = 12 * 60 * 60_000;
+
+let friendsCache: FriendsCache | null = null;
+let friendsRefreshAttemptAt = 0;
+let identity: LocalIdentity | null = null;
+let observedFriendshipKey: string | null = null;
+let refreshPending: Promise<void> | null = null;
+let refreshRunning: Promise<void> | null = null;
+let started = false;
+let startPromise: Promise<void> | null = null;
+let uid = '';
+let unsubscribeFriendships: Unsubscribe | null = null;
 
 function reportPresenceError(action: string, cause: unknown) {
   const message = cause instanceof Error ? cause.message : 'Unknown error';
 
   console.error(`[Twitch Friends] ${action}: ${message}`);
 }
+
+function withTimeout<T>(promise: Promise<T>, milliseconds: number) {
+  return new Promise<T>((resolve, reject) => {
+    const handle = setTimeout(() => {
+      reject(new Error('Firebase request timed out.'));
+    }, milliseconds);
+
+    promise.then(
+      (value) => {
+        clearTimeout(handle);
+        resolve(value);
+      },
+      (cause: unknown) => {
+        clearTimeout(handle);
+        reject(cause instanceof Error ? cause : new Error('Firebase request failed.'));
+      },
+    );
+  });
+}
+
+const timers = {
+  clearTimer: (handle: ReturnType<typeof setTimeout>) => clearTimeout(handle),
+  now: () => Date.now(),
+  setTimer: (callback: () => void, delay: number) => setTimeout(callback, delay),
+};
+
+function presencePath(recipientId: string, senderId: string) {
+  return `presence/${recipientId}/${senderId}`;
+}
+
+const publisher = new PresencePublisher({
+  ...timers,
+  onError: reportPresenceError,
+  onPublished: ({ channel, latency, recipients }) => {
+    logPresenceTiming(
+      'channel selection -> Firebase acknowledged',
+      latency,
+      `${channel?.login ?? 'cleared'}, ${recipients} recipients`,
+    );
+  },
+  persistPublishedRecipients: (recipientIds) => {
+    void browser.storage.session
+      .set({ [PUBLISHED_RECIPIENTS_KEY]: recipientIds })
+      .catch((cause: unknown) => reportPresenceError('Presence state could not be saved', cause));
+  },
+  remove: async (recipientId) => {
+    if (!uid) {
+      throw new Error('Presence is not started.');
+    }
+
+    await withTimeout(
+      remove(ref(getFirebaseDatabase(), presencePath(recipientId, uid))),
+      presenceWriteTimeout,
+    );
+  },
+  write: async (recipient, channel, isCurrent) => {
+    const localIdentity = identity;
+
+    if (!localIdentity || !uid) {
+      throw new Error('Presence is not started.');
+    }
+
+    const encrypted = await encryptPresence(localIdentity, recipient.encryptionKey, channel);
+
+    if (!isCurrent()) {
+      return false;
+    }
+
+    await withTimeout(
+      set(ref(getFirebaseDatabase(), presencePath(recipient.id, uid)), encrypted),
+      presenceWriteTimeout,
+    );
+
+    return true;
+  },
+});
+
+const receiver = new PresenceReceiver({
+  ...timers,
+  decrypt: (friend, presence) =>
+    identity ? decryptPresence(identity, friend.encryptionKey, presence) : Promise.resolve(null),
+  onError: reportPresenceError,
+  onReceived: ({ expiresAt, friendId }) => {
+    logPresenceTiming(
+      'friend write -> local decode',
+      Date.now() - (expiresAt - presenceLifetime),
+      friendId,
+    );
+  },
+  onUndecryptable: () => {
+    refreshFriendsIfAllowed();
+  },
+  save: saveFriendPresence,
+  subscribe: (onRecords, onError) =>
+    onValue(
+      ref(getFirebaseDatabase(), `presence/${uid}`),
+      (snapshot) => {
+        const value: unknown = snapshot.val();
+
+        onRecords(value && typeof value === 'object' ? (value as Record<string, unknown>) : {});
+      },
+      onError,
+    ),
+});
 
 function parsePublicKey(value: unknown): PublicIdentityKey | null {
   if (!value || typeof value !== 'object') {
@@ -71,7 +181,22 @@ function parsePublicKey(value: unknown): PublicIdentityKey | null {
   };
 }
 
-function parsePresenceFriends(value: unknown): PresenceFriend[] {
+function parseRecipient(id: unknown, login: unknown, encryptionKey: unknown) {
+  const key = parsePublicKey(encryptionKey);
+  const normalizedLogin = typeof login === 'string' ? normalizeTwitchLogin(login) : null;
+
+  if (!key || typeof id !== 'string' || !/^[a-z0-9_-]{1,128}$/iu.test(id) || !normalizedLogin) {
+    return null;
+  }
+
+  return {
+    encryptionKey: key,
+    id,
+    login: normalizedLogin,
+  };
+}
+
+export function parsePresenceFriends(value: unknown): PresenceRecipient[] {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -86,292 +211,262 @@ function parsePresenceFriends(value: unknown): PresenceFriend[] {
       friend.profile && typeof friend.profile === 'object'
         ? (friend.profile as Record<string, unknown>)
         : {};
-    const encryptionKey = parsePublicKey(friend.encryptionKey);
+    const recipient = parseRecipient(friend.id, profile.login, friend.encryptionKey);
 
-    const login = typeof profile.login === 'string' ? normalizeTwitchLogin(profile.login) : null;
-
-    if (
-      !encryptionKey ||
-      typeof friend.id !== 'string' ||
-      !/^[a-z0-9_-]{1,128}$/iu.test(friend.id) ||
-      !login
-    ) {
-      return [];
-    }
-
-    return [
-      {
-        encryptionKey,
-        id: friend.id,
-        login,
-      },
-    ];
+    return recipient ? [recipient] : [];
   });
 }
 
-function parseEncryptedPresence(value: unknown): EncryptedPresence | null {
+export function parseFriendsCache(value: unknown, expectedUid: string): FriendsCache | null {
   if (!value || typeof value !== 'object') {
     return null;
   }
 
-  const presence = value as Record<string, unknown>;
+  const cache = value as Record<string, unknown>;
 
   if (
-    typeof presence.ciphertext !== 'string' ||
-    !/^[A-Za-z0-9_-]{16,512}$/u.test(presence.ciphertext) ||
-    typeof presence.expiresAt !== 'number' ||
-    !Number.isSafeInteger(presence.expiresAt) ||
-    typeof presence.iv !== 'string' ||
-    !/^[A-Za-z0-9_-]{16}$/u.test(presence.iv) ||
-    presence.version !== 1
+    cache.version !== 1 ||
+    cache.uid !== expectedUid ||
+    typeof cache.fetchedAt !== 'number' ||
+    !Number.isSafeInteger(cache.fetchedAt) ||
+    (cache.friendshipKey !== null && typeof cache.friendshipKey !== 'string') ||
+    !Array.isArray(cache.items)
   ) {
     return null;
   }
 
+  const items: PresenceRecipient[] = [];
+
+  for (const item of cache.items) {
+    const record = item && typeof item === 'object' ? (item as Record<string, unknown>) : {};
+    const recipient = parseRecipient(record.id, record.login, record.encryptionKey);
+
+    if (!recipient) {
+      return null;
+    }
+
+    items.push(recipient);
+  }
+
   return {
-    ciphertext: presence.ciphertext,
-    expiresAt: presence.expiresAt,
-    iv: presence.iv,
+    fetchedAt: cache.fetchedAt,
+    friendshipKey: cache.friendshipKey,
+    items,
+    uid: expectedUid,
     version: 1,
   };
 }
 
-async function registerIdentity(localIdentity: LocalIdentity) {
+async function ensureIdentityRegistered(currentUid: string, localIdentity: LocalIdentity) {
+  const publicKey = localIdentity.encryptionPublicKey;
+  const stored: Record<string, unknown> =
+    await browser.storage.local.get(PRESENCE_REGISTRATION_KEY);
+  const registration = stored[PRESENCE_REGISTRATION_KEY];
+  const record =
+    registration && typeof registration === 'object'
+      ? (registration as Record<string, unknown>)
+      : null;
+
+  if (
+    record?.version === 1 &&
+    record.uid === currentUid &&
+    record.x === publicKey.x &&
+    record.y === publicKey.y &&
+    typeof record.registeredAt === 'number' &&
+    Date.now() - record.registeredAt < registrationMaxAge
+  ) {
+    return;
+  }
+
   await requestBackend('/api/identity', {
     body: {
-      encryptionKey: localIdentity.encryptionPublicKey,
+      encryptionKey: publicKey,
     },
     method: 'PUT',
   });
-}
-
-async function refreshFriends() {
-  const result = await requestBackend<unknown>('/api/presence-friends');
-
-  friends = parsePresenceFriends(result);
-}
-
-async function clearPublishedPresence() {
-  const database = getFirebaseDatabase();
-
-  await Promise.all(
-    [...publishedRecipients].map((recipientUid) =>
-      remove(ref(database, `presence/${recipientUid}/${uid}`)),
-    ),
-  );
-  publishedRecipients = new Set();
-}
-
-async function publishPresence() {
-  if (!identity || !uid) {
-    return;
-  }
-
-  if (!activeChannel) {
-    await clearPublishedPresence();
-    return;
-  }
-
-  const database = getFirebaseDatabase();
-  const nextRecipients = new Set(friends.map((friend) => friend.id));
-
-  const publishResults = await Promise.allSettled(
-    friends.map(async (friend) => {
-      if (!identity || !activeChannel) {
-        return;
-      }
-
-      const reference = ref(database, `presence/${friend.id}/${uid}`);
-      const encrypted = await encryptPresence(identity, friend.encryptionKey, activeChannel);
-
-      await set(reference, encrypted);
-    }),
-  );
-  const removalResults = await Promise.allSettled(
-    [...publishedRecipients]
-      .filter((recipientUid) => !nextRecipients.has(recipientUid))
-      .map((recipientUid) => remove(ref(database, `presence/${recipientUid}/${uid}`))),
-  );
-  publishedRecipients = nextRecipients;
-  lastPresencePublishAt = Date.now();
-
-  for (const result of [...publishResults, ...removalResults]) {
-    if (result.status === 'rejected') {
-      reportPresenceError('Presence update failed', result.reason);
-    }
-  }
-}
-
-function queuePresencePublish() {
-  const nextPublish = publishQueue.catch(() => undefined).then(publishPresence);
-
-  publishQueue = nextPublish;
-
-  return nextPublish;
-}
-
-function schedulePresenceExpiry(items: FriendPresence[], revision: number) {
-  if (presenceExpiryTimer !== null) {
-    clearTimeout(presenceExpiryTimer);
-    presenceExpiryTimer = null;
-  }
-
-  if (items.length === 0) {
-    return;
-  }
-
-  const earliestExpiry = Math.min(...items.map((item) => item.expiresAt));
-
-  presenceExpiryTimer = setTimeout(
-    () => {
-      presenceExpiryTimer = null;
-
-      if (revision !== presenceRevision) {
-        return;
-      }
-
-      const remainingItems = items.filter((item) => item.expiresAt > Date.now());
-
-      void saveFriendPresence(remainingItems)
-        .then(() => schedulePresenceExpiry(remainingItems, revision))
-        .catch(() => undefined);
+  await browser.storage.local.set({
+    [PRESENCE_REGISTRATION_KEY]: {
+      registeredAt: Date.now(),
+      uid: currentUid,
+      version: 1,
+      x: publicKey.x,
+      y: publicKey.y,
     },
-    Math.max(0, earliestExpiry - Date.now() + 50),
-  );
+  });
 }
 
-function listenForPresence() {
-  if (!identity || !uid) {
+function applyFriends(items: PresenceRecipient[]) {
+  publisher.setRecipients(items);
+  receiver.setFriends(items);
+}
+
+async function fetchPresenceFriends() {
+  if (!uid) {
     return;
   }
 
-  unsubscribePresence?.();
-  if (presenceExpiryTimer !== null) {
-    clearTimeout(presenceExpiryTimer);
-    presenceExpiryTimer = null;
+  const currentUid = uid;
+  const friendshipKey = observedFriendshipKey;
+
+  friendsRefreshAttemptAt = Date.now();
+
+  const items = parsePresenceFriends(await requestBackend<unknown>('/api/presence-friends'));
+
+  if (currentUid !== uid) {
+    return;
   }
-  presenceRevision += 1;
 
-  const localIdentity = identity;
-  const database = getFirebaseDatabase();
+  friendsCache = {
+    fetchedAt: Date.now(),
+    friendshipKey,
+    items,
+    uid: currentUid,
+    version: 1,
+  };
+  applyFriends(items);
+  await browser.storage.local.set({ [PRESENCE_FRIENDS_CACHE_KEY]: friendsCache });
+}
 
-  unsubscribePresence = onValue(
-    ref(database, `presence/${uid}`),
+export function refreshPresenceFriends(): Promise<void> {
+  if (!refreshRunning) {
+    const run = fetchPresenceFriends().finally(() => {
+      refreshRunning = null;
+    });
+
+    refreshRunning = run;
+
+    return run;
+  }
+
+  refreshPending ??= refreshRunning
+    .catch(() => undefined)
+    .then(() => {
+      refreshPending = null;
+
+      return refreshPresenceFriends();
+    });
+
+  return refreshPending;
+}
+
+function watchFriendships() {
+  if (unsubscribeFriendships || !uid) {
+    return;
+  }
+
+  unsubscribeFriendships = onValue(
+    ref(getFirebaseDatabase(), `friendships/${uid}`),
     (snapshot) => {
-      const revision = ++presenceRevision;
       const value: unknown = snapshot.val();
-      const records = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
 
-      void Promise.all(
-        friends.map(async (friend): Promise<FriendPresence | null> => {
-          const encrypted = parseEncryptedPresence(records[friend.id]);
+      observedFriendshipKey =
+        value && typeof value === 'object' ? Object.keys(value).sort().join(',') : '';
 
-          if (!encrypted) {
-            return null;
-          }
-
-          const channel = await decryptPresence(localIdentity, friend.encryptionKey, encrypted);
-
-          return channel
-            ? {
-                channel,
-                expiresAt: encrypted.expiresAt,
-                friendId: friend.id,
-                login: friend.login,
-              }
-            : null;
-        }),
-      )
-        .then(async (items) => {
-          if (revision !== presenceRevision) {
-            return;
-          }
-
-          const validItems = items.filter((item) => item !== null);
-
-          await saveFriendPresence(validItems);
-          schedulePresenceExpiry(validItems, revision);
-        })
-        .catch(() => {
-          if (revision === presenceRevision) {
-            void saveFriendPresence([]).catch(() => undefined);
-          }
+      if (friendsCache?.friendshipKey !== observedFriendshipKey) {
+        void refreshPresenceFriends().catch((cause: unknown) => {
+          reportPresenceError('Friends presence could not refresh', cause);
         });
-    },
-    () => {
-      presenceRevision += 1;
-      if (presenceExpiryTimer !== null) {
-        clearTimeout(presenceExpiryTimer);
-        presenceExpiryTimer = null;
       }
-      void saveFriendPresence([]);
+    },
+    (cause) => {
+      unsubscribeFriendships = null;
+      reportPresenceError('Friendship listener failed', cause);
     },
   );
 }
 
-async function refreshPresenceState() {
-  await refreshFriends();
-  listenForPresence();
-  await queuePresencePublish();
+async function loadPublishedRecipients() {
+  try {
+    const stored: Record<string, unknown> =
+      await browser.storage.session.get(PUBLISHED_RECIPIENTS_KEY);
+    const value = stored[PUBLISHED_RECIPIENTS_KEY];
+
+    return Array.isArray(value)
+      ? value.filter(
+          (item): item is string => typeof item === 'string' && /^[a-z0-9_-]{1,128}$/iu.test(item),
+        )
+      : [];
+  } catch {
+    return [];
+  }
 }
 
-function startPresenceTimers() {
-  if (timersStarted) {
-    return;
+async function startPresence() {
+  const currentUid = await ensureAnonymousAuth();
+  const localIdentity = await getOrCreateLocalIdentity();
+
+  await ensureIdentityRegistered(currentUid, localIdentity);
+
+  const [stored, publishedRecipients] = await Promise.all([
+    browser.storage.local.get(PRESENCE_FRIENDS_CACHE_KEY),
+    loadPublishedRecipients(),
+  ]);
+
+  uid = currentUid;
+  identity = localIdentity;
+  friendsCache = parseFriendsCache(stored[PRESENCE_FRIENDS_CACHE_KEY], currentUid);
+  publisher.restorePublishedRecipients(publishedRecipients);
+
+  if (!friendsCache) {
+    await fetchPresenceFriends();
+  } else {
+    applyFriends(friendsCache.items);
   }
 
-  timersStarted = true;
-  globalThis.setInterval(() => {
-    void queuePresencePublish().catch((cause: unknown) => {
-      reportPresenceError('Presence heartbeat failed', cause);
-    });
-  }, presencePublishInterval);
-  globalThis.setInterval(() => {
+  receiver.start();
+  watchFriendships();
+  started = true;
+
+  if (friendsCache && Date.now() - friendsCache.fetchedAt > friendsCacheMaxAge) {
     void refreshPresenceFriends().catch((cause: unknown) => {
-      reportPresenceError('Presence service refresh failed', cause);
+      reportPresenceError('Friends presence could not refresh', cause);
     });
-  }, presenceServiceRefreshInterval);
+  }
 }
 
-export async function startPresenceSync(channel: TwitchChannel | null) {
-  activeChannel = channel;
-  uid = await ensureAnonymousAuth();
-  identity = await getOrCreateLocalIdentity();
-
-  await registerIdentity(identity);
-  startPresenceTimers();
-  await refreshPresenceState();
-}
-
-export function updatePresenceChannel(channel: TwitchChannel | null) {
-  activeChannel = channel;
-
-  if (presencePublishTimer !== null) {
-    clearTimeout(presencePublishTimer);
+export function startPresenceSync() {
+  if (started) {
+    return identity ? ensureIdentityRegistered(uid, identity) : Promise.resolve();
   }
 
-  presencePublishTimer = setTimeout(() => {
-    presencePublishTimer = null;
-    void queuePresencePublish().catch((cause: unknown) => {
-      reportPresenceError('Presence channel update failed', cause);
-    });
-  }, presencePublishDelay);
+  startPromise ??= startPresence().finally(() => {
+    startPromise = null;
+  });
+
+  return startPromise;
 }
 
-export function refreshPresenceHeartbeat() {
-  if (!activeChannel || !isPresenceHeartbeatDue(lastPresencePublishAt)) {
+export function isPresenceStarted() {
+  return started;
+}
+
+export function getPresenceUid() {
+  return started ? uid : null;
+}
+
+export function setPresenceChannel(channel: TwitchChannel | null) {
+  publisher.setChannel(channel);
+}
+
+function refreshFriendsIfAllowed() {
+  if (!started || Date.now() - friendsRefreshAttemptAt <= friendsRefreshRetryInterval) {
     return;
   }
 
-  void queuePresencePublish().catch((cause: unknown) => {
-    reportPresenceError('Presence content heartbeat failed', cause);
+  friendsRefreshAttemptAt = Date.now();
+  void refreshPresenceFriends().catch((cause: unknown) => {
+    reportPresenceError('Friends presence could not refresh', cause);
   });
 }
 
-export function refreshPresenceFriends() {
-  refreshPromise ??= refreshPresenceState().finally(() => {
-    refreshPromise = null;
-  });
+export function ensurePresenceFresh() {
+  publisher.ensureFresh();
 
-  return refreshPromise;
+  if (friendsCache && Date.now() - friendsCache.fetchedAt > friendsCacheMaxAge) {
+    refreshFriendsIfAllowed();
+  }
+}
+
+export async function invalidatePresenceRegistration() {
+  await browser.storage.local.remove(PRESENCE_REGISTRATION_KEY);
 }

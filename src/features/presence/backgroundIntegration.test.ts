@@ -82,10 +82,13 @@ vi.mock('@/infrastructure/firebase/firebaseAuth', () => ({
   setFirebaseSessionAuthority: platform.sessionAuthority,
 }));
 vi.mock('@/features/presence/presenceSync', () => ({
+  ensurePresenceFresh: vi.fn(),
+  getPresenceUid: () => null,
+  invalidatePresenceRegistration: () => Promise.resolve(),
+  isPresenceStarted: () => false,
   refreshPresenceFriends: () => Promise.resolve(),
-  refreshPresenceHeartbeat: vi.fn(),
   startPresenceSync: platform.startPresence,
-  updatePresenceChannel: platform.updateChannel,
+  setPresenceChannel: platform.updateChannel,
 }));
 vi.mock('@/security/identity/localIdentity', () => ({
   getOrCreateLocalIdentity: () => Promise.resolve({ encryptionPrivateKey: { extractable: false } }),
@@ -125,6 +128,33 @@ afterEach(() => {
 });
 
 describe('background session and tab integration', () => {
+  it('retries a failed initialization on a channel report after the retry interval', async () => {
+    platform.consent = true;
+    platform.auth.mockRejectedValueOnce(new Error('Temporary auth failure'));
+    const listener = await boot();
+    const sender = {
+      id: 'extension-id',
+      tab: { active: true, id: 1, windowId: 1 },
+      url: 'https://www.twitch.tv/stream',
+    };
+    const message = {
+      channel: { login: 'stream', url: 'https://www.twitch.tv/stream' },
+      type: 'active-channel:update',
+    };
+
+    listener(message, sender, vi.fn());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(platform.auth).toHaveBeenCalledOnce();
+    expect(platform.startPresence).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    listener(message, sender, vi.fn());
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(platform.auth).toHaveBeenCalledTimes(2);
+    expect(platform.startPresence).toHaveBeenCalledOnce();
+  });
+
   it('establishes background session authority without authenticating before consent', async () => {
     await boot();
 
@@ -181,10 +211,14 @@ describe('background session and tab integration', () => {
     const listener = await boot();
     const respond = vi.fn();
 
-    expect(platform.startPresence).toHaveBeenCalledWith({
+    expect(platform.updateChannel).toHaveBeenCalledWith({
       login: 'stream',
       url: 'https://www.twitch.tv/stream',
     });
+    expect(platform.startPresence).toHaveBeenCalledOnce();
+    expect(platform.updateChannel.mock.invocationCallOrder[0]).toBeLessThan(
+      platform.startPresence.mock.invocationCallOrder[0] ?? 0,
+    );
     expect(listener({ type: ACTIVE_CHANNEL_GET }, { id: 'extension-id' }, respond)).toBe(true);
     await vi.advanceTimersByTimeAsync(0);
     expect(respond).toHaveBeenCalledWith({ login: 'stream', url: 'https://www.twitch.tv/stream' });
