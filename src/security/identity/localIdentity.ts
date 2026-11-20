@@ -37,10 +37,41 @@ async function createLocalIdentity(): Promise<LocalIdentity> {
   };
 }
 
-async function loadOrCreateLocalIdentity() {
-  const existingIdentity = await readLocalIdentity();
+function isBase64UrlCoordinate(value: unknown) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/u.test(value);
+}
 
-  if (existingIdentity) {
+export function isUsableLocalIdentity(value: unknown): value is LocalIdentity {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const identity = value as Record<string, unknown>;
+  const privateKey = identity.encryptionPrivateKey;
+  const publicKey =
+    identity.encryptionPublicKey && typeof identity.encryptionPublicKey === 'object'
+      ? (identity.encryptionPublicKey as Record<string, unknown>)
+      : null;
+
+  return (
+    identity.version === 1 &&
+    typeof identity.createdAt === 'number' &&
+    privateKey instanceof CryptoKey &&
+    privateKey.type === 'private' &&
+    privateKey.algorithm.name === 'ECDH' &&
+    (privateKey.algorithm as EcKeyAlgorithm).namedCurve === 'P-256' &&
+    privateKey.usages.includes('deriveBits') &&
+    publicKey?.crv === 'P-256' &&
+    publicKey.kty === 'EC' &&
+    isBase64UrlCoordinate(publicKey.x) &&
+    isBase64UrlCoordinate(publicKey.y)
+  );
+}
+
+async function loadOrCreateLocalIdentity() {
+  const existingIdentity: unknown = await readLocalIdentity();
+
+  if (isUsableLocalIdentity(existingIdentity)) {
     return existingIdentity;
   }
 

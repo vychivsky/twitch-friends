@@ -1,4 +1,4 @@
-import { getApp, getApps, initializeApp } from 'firebase/app';
+import { deleteApp, getApp, getApps, initializeApp } from 'firebase/app';
 
 import { getFirebaseEnvironment } from '@/config/firebaseEnvironment';
 
@@ -16,4 +16,8 @@ export function getFirebaseApp() {
     databaseURL: environment.databaseUrl,
     projectId: environment.projectId,
   });
+}
+
+export async function resetFirebaseApp() {
+  await Promise.all(getApps().map((app) => deleteApp(app)));
 }
