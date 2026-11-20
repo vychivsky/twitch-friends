@@ -24,7 +24,8 @@ export default defineConfig({
           32: 'icons/icon-32.png',
         },
       },
-      permissions: manifestVersion === 2 ? ['storage', ...backendHosts] : ['storage'],
+      permissions:
+        manifestVersion === 2 ? ['alarms', 'storage', ...backendHosts] : ['alarms', 'storage'],
       ...(manifestVersion === 3
         ? {
             content_security_policy: {

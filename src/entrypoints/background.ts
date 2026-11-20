@@ -1,5 +1,7 @@
 import { getFirebaseEnvironment } from '@/config/firebaseEnvironment';
 import { LOCAL_FRIENDS_KEY } from '@/features/friends/localFriends';
+import { ACTIVE_TAB_STATE_KEY } from '@/features/presence/activeTabState';
+import { PresenceTabTracker } from '@/features/presence/presenceTabTracker';
 import {
   isActiveChannelRequest,
   isActiveChannelUpdate,
@@ -36,49 +38,15 @@ import { getOrCreateLocalIdentity } from '@/security/identity/localIdentity';
 import { browser } from 'wxt/browser';
 
 let activeChannel: TwitchChannel | null = null;
-let activeTabId: number | null = null;
 let presenceStarted = false;
 let presenceStartPromise: Promise<void> | null = null;
-const tabChannels = new Map<number, TwitchChannel | null>();
+let restoreTabState = Promise.resolve();
+const TAB_TRACKER_ALARM = 'presence-tab-tracker';
 
 function reportPresenceError(action: string, cause: unknown) {
   const message = cause instanceof Error ? cause.message : 'Unknown error';
 
   console.error(`[Twitch Friends] ${action}: ${message}`);
-}
-
-function selectChannel(tabId: number, channel: TwitchChannel) {
-  const unchanged =
-    activeTabId === tabId &&
-    activeChannel?.login === channel.login &&
-    activeChannel.url === channel.url;
-
-  activeTabId = tabId;
-  activeChannel = channel;
-  tabChannels.delete(tabId);
-  tabChannels.set(tabId, channel);
-
-  if (unchanged) {
-    refreshPresenceHeartbeat();
-    return;
-  }
-
-  updatePresenceChannel(activeChannel);
-}
-
-function selectFallbackChannel() {
-  const fallback = [...tabChannels.entries()]
-    .reverse()
-    .find((entry): entry is [number, TwitchChannel] => entry[1] !== null);
-
-  if (fallback) {
-    selectChannel(...fallback);
-    return;
-  }
-
-  activeTabId = null;
-  activeChannel = null;
-  updatePresenceChannel(null);
 }
 
 async function initializeBackground() {
@@ -155,6 +123,7 @@ function startPresenceIfConnected() {
 
   presenceStartPromise ??= (async () => {
     try {
+      await restoreTabState;
       const profile = await getMyTwitchProfile();
 
       if (!profile) {
@@ -186,6 +155,57 @@ function isExtensionPageSender(sender: { id?: string; tab?: unknown; url?: strin
 export default defineBackground(() => {
   setFirebaseSessionAuthority();
 
+  let alarmUpdate = Promise.resolve();
+  const tracker = new PresenceTabTracker({
+    getActiveTabId: async (windowId) => {
+      const [tab] = await browser.tabs.query({ active: true, windowId });
+
+      return tab?.id ?? null;
+    },
+    getFocusedWindowId: async () => {
+      const focused = await browser.windows.getLastFocused();
+
+      return focused.id ?? null;
+    },
+    loadState: async () => {
+      const stored: Record<string, unknown> =
+        await browser.storage.session.get(ACTIVE_TAB_STATE_KEY);
+
+      return stored[ACTIVE_TAB_STATE_KEY];
+    },
+    now: () => Date.now(),
+    onError: reportPresenceError,
+    onSelectionChange: (selection) => {
+      activeChannel = selection?.channel ?? null;
+      updatePresenceChannel(activeChannel);
+      alarmUpdate = alarmUpdate
+        .then(async () => {
+          if (selection) {
+            if (!(await browser.alarms.get(TAB_TRACKER_ALARM))) {
+              await browser.alarms.create(TAB_TRACKER_ALARM, { periodInMinutes: 0.5 });
+            }
+          } else {
+            await browser.alarms.clear(TAB_TRACKER_ALARM);
+          }
+        })
+        .catch((cause: unknown) =>
+          reportPresenceError('Tab tracker alarm could not update', cause),
+        );
+    },
+    onUnchanged: () => refreshPresenceHeartbeat(),
+    saveState: (state) => browser.storage.session.set({ [ACTIVE_TAB_STATE_KEY]: state }),
+    tabExists: async (tabId) => {
+      try {
+        await browser.tabs.get(tabId);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
+
+  restoreTabState = tracker.getSelection().then(() => undefined);
+
   browser.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
     if (sender.id !== browser.runtime.id) {
       return false;
@@ -205,17 +225,15 @@ export default defineBackground(() => {
       typeof sender.tab?.id === 'number' &&
       sender.url?.startsWith('https://www.twitch.tv/')
     ) {
-      const tabId = sender.tab.id;
-
-      tabChannels.set(tabId, message.channel);
-
-      if (message.channel && (sender.tab.active || activeTabId === tabId || !activeChannel)) {
-        selectChannel(tabId, message.channel);
-      } else if (!message.channel && activeTabId === tabId) {
-        selectFallbackChannel();
-      }
+      void tracker.reportChannel({
+        active: sender.tab.active,
+        channel: message.channel,
+        tabId: sender.tab.id,
+        windowId: sender.tab.windowId,
+      });
     } else if (isActiveChannelRequest(message)) {
-      sendResponse(activeChannel);
+      void tracker.getSelection().then((selection) => sendResponse(selection?.channel ?? null));
+      return true;
     } else if (isRuntimeStatusRequest(message)) {
       sendResponse(getRuntimeStatus());
     } else if (isPrivacyConsentAcceptedMessage(message)) {
@@ -239,19 +257,25 @@ export default defineBackground(() => {
     }
   });
 
-  browser.tabs.onActivated.addListener(({ tabId }) => {
-    const channel = tabChannels.get(tabId);
-
-    if (channel) {
-      selectChannel(tabId, channel);
-    }
+  browser.tabs.onActivated.addListener(({ tabId, windowId }) => {
+    void tracker.activateTab(tabId, windowId);
   });
 
   browser.tabs.onRemoved.addListener((tabId) => {
-    tabChannels.delete(tabId);
+    void tracker.removeTab(tabId);
+  });
 
-    if (activeTabId === tabId) {
-      selectFallbackChannel();
+  browser.tabs.onReplaced.addListener((_addedTabId, removedTabId) => {
+    void tracker.removeTab(removedTabId);
+  });
+
+  browser.windows.onFocusChanged.addListener((windowId) => {
+    void tracker.focusWindow(windowId);
+  });
+
+  browser.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === TAB_TRACKER_ALARM) {
+      void tracker.heartbeat();
     }
   });
 
