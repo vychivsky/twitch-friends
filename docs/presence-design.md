@@ -1,6 +1,6 @@
-# Twitch Friends
+# Presence and session architecture
 
-> Design status: this is the proposed end-state, not the behavior currently merged into `main`. Session persistence is tracked in PR #2, scoped Worker synchronization in PR #3, and navigation detection in PR #1. Tab tracking, publisher/receiver retries, caches, alarm heartbeats, and timing instrumentation remain unmerged work. Commands and test coverage in this design are proposals; use the [root README](../README.md) for commands available on `main`.
+> Implementation reference: the session guard, scoped friendship synchronization, tab tracker, publisher/receiver, caches, and retry paths described here are implemented. Automated tests do not certify production reliability. See the [root README](../README.md) for the project overview and current release limitations.
 
 Twitch Friends is a browser extension that adds a **Friends** section to the Twitch sidebar. People
 who accepted each other as friends can see which live channel the other person is watching. Presence
@@ -141,8 +141,8 @@ change. A change there triggers a refresh, so a new or removed friend takes effe
 reopening the popup. A restart with valid caches makes no Worker requests.
 
 Development builds (`npm run dev`) log stage timings to the background console as
-`[Twitch Friends][timing]`. They cover content detection to background selection, selection to
-Firebase acknowledgement, and the friend's write to local decode. The last one is only meaningful
+`[Twitch Friends][timing]`. They cover channel selection to Firebase acknowledgement and the
+friend's write to local decode. The last one is only meaningful
 when both profiles run on the same machine. Production builds contain no timing code.
 
 ## Sessions and identity
@@ -326,23 +326,22 @@ production.
 
 ## Commands
 
-| Command                                                   | Purpose                                                                    |
-| --------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `npm run dev` / `npm run dev:firefox`                     | Development build with reload                                              |
-| `npm run build` / `npm run build:firefox`                 | Production extension build                                                 |
-| `npm run zip` / `npm run zip:firefox`                     | Package the extension                                                      |
-| `npm run check`                                           | Comment policy, formatting, ESLint, TypeScript, extension and Worker tests |
-| `npm run check:comments`                                  | Reject comments in first-party code and configuration                      |
-| `npm test`                                                | Extension and script unit tests                                            |
-| `npm run test:worker`                                     | Worker unit tests                                                          |
-| `npm run test:rules`                                      | Realtime Database Rules tests in the emulator                              |
-| `npm run firebase:emulators`                              | Start the Auth, Database, and Firestore emulators                          |
-| `npm run firebase:rules:check`                            | Verify the Rules hash and the production project alias                     |
-| `npm run firebase:rules:release`                          | Test, deploy, and smoke-check production Rules                             |
-| `npm run worker:dev`                                      | Local Worker with local D1                                                 |
-| `npm run worker:migrate:local`                            | Apply D1 migrations locally                                                |
-| `npm run worker:build`                                    | Worker dry-run bundle                                                      |
-| `npm run worker:migrate:remote` / `npm run worker:deploy` | Production D1 migrations and Worker deploy                                 |
+| Command                                                   | Purpose                                                    |
+| --------------------------------------------------------- | ---------------------------------------------------------- |
+| `npm run dev` / `npm run dev:firefox`                     | Development build with reload                              |
+| `npm run build` / `npm run build:firefox`                 | Production extension build                                 |
+| `npm run zip` / `npm run zip:firefox`                     | Package the extension                                      |
+| `npm run check`                                           | Formatting, ESLint, TypeScript, extension and Worker tests |
+| `npm test`                                                | Extension unit tests                                       |
+| `npm run test:worker`                                     | Worker unit tests                                          |
+| `npm run test:rules`                                      | Realtime Database Rules tests in the emulator              |
+| `npm run firebase:emulators`                              | Start the Auth, Database, and Firestore emulators          |
+| `npm run firebase:rules:check`                            | Verify the Rules hash and the production project alias     |
+| `npm run firebase:rules:release`                          | Test, deploy, and smoke-check production Rules             |
+| `npm run worker:dev`                                      | Local Worker with local D1                                 |
+| `npm run worker:migrate:local`                            | Apply D1 migrations locally                                |
+| `npm run worker:build`                                    | Worker dry-run bundle                                      |
+| `npm run worker:migrate:remote` / `npm run worker:deploy` | Production D1 migrations and Worker deploy                 |
 
 ## Testing
 
@@ -356,8 +355,9 @@ npm run build
 npm run build:firefox
 ```
 
-The target CI workflow would run these steps; the current workflow does not include comment-policy or audit checks. Current CI on every push to `main` and on every pull
-request. Actions are pinned to commit SHAs, and the workflow token is read-only.
+CI runs the checks, Rules tests, and builds on pushes to `main` and pull requests. The optional
+`npm audit` command above is a separate manual check, not a CI step. Actions are pinned to commit
+SHAs, and the workflow token is read-only.
 
 The unit tests cover:
 
@@ -366,7 +366,6 @@ The unit tests cover:
 - Multi-tab selection: restart restore, window focus, and closing the active tab.
 - Firebase session restoration: restart, temporary failure, revoked user, and extension pages.
 - Identity recovery, account disconnect and deletion, and Worker routes.
-- The comment checker (proposal only, not part of current `main`).
 
 The Rules tests cover friendship-gated writes, cleanup after a friendship ends, expiry limits, and
 forgery attempts.
@@ -415,7 +414,6 @@ in `WXT_PUBLIC_` variables, `wrangler.jsonc`, the repository, or issues.
 | Presence shows an old channel                          | Look for `[Twitch Friends][timing]` lines in a development build. The record refreshes within 25 seconds and expires after 60.                       |
 | `Request limit reached`                                | Per-account hourly limits apply. Wait and retry.                                                                                                     |
 | Rules tests fail to start                              | Java 21 must be on `PATH`, and ports 9000, 9099, and 8080 must be free.                                                                              |
-| `npm run check:comments` fails                         | Remove the reported comment. Document the behaviour in `docs/` or express it in names and tests.                                                     |
 
 ## Repository structure
 
@@ -435,7 +433,7 @@ worker/
   src/                  Worker routes, Firebase token verification, D1 repository, Twitch client
   migrations/           D1 schema
 firebase/rules/         Realtime Database and Firestore Rules, Rules tests, Rules hash
-scripts/                Rules verification, smoke test, comment policy
+scripts/                Rules verification and smoke test
 docs/                   security architecture and session persistence
 public/                 icons, privacy notice, beta terms
 ```

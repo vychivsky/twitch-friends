@@ -19,7 +19,12 @@ import {
 import { isAccountSetupRequired } from '@/features/profile/accountState';
 import { isTwitchProfileConnectedMessage } from '@/features/profile/myTwitchProfile';
 import { BackendError } from '@/infrastructure/backend/backendApi';
-import { ensureAnonymousAuth } from '@/infrastructure/firebase/firebaseAuth';
+import {
+  answerFirebaseSessionRequest,
+  ensureAnonymousAuth,
+  isFirebaseSessionRequest,
+  setFirebaseSessionAuthority,
+} from '@/infrastructure/firebase/firebaseAuth';
 import {
   getRuntimeStatus,
   isRuntimeStatusRequest,
@@ -160,7 +165,18 @@ async function handleTwitchProfileConnected() {
 
   await initializeBackground();
 }
+function isExtensionPageSender(sender: { id?: string; tab?: unknown; url?: string }) {
+  return (
+    sender.id === browser.runtime.id &&
+    sender.tab === undefined &&
+    typeof sender.url === 'string' &&
+    sender.url.startsWith(browser.runtime.getURL('/'))
+  );
+}
+
 export default defineBackground(() => {
+  setFirebaseSessionAuthority();
+
   let alarmUpdate = Promise.resolve();
   const tracker = new PresenceTabTracker({
     getActiveTabId: async (windowId) => {
@@ -214,6 +230,15 @@ export default defineBackground(() => {
   browser.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
     if (sender.id !== browser.runtime.id) {
       return false;
+    }
+
+    if (isFirebaseSessionRequest(message)) {
+      if (!isExtensionPageSender(sender)) {
+        return false;
+      }
+
+      void answerFirebaseSessionRequest(message).then(sendResponse);
+      return true;
     }
 
     if (

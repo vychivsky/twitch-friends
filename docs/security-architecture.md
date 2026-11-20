@@ -1,6 +1,6 @@
 # Security Architecture
 
-> Implementation status: the base trust boundaries and encryption model are implemented. Protected session persistence (PR #2), scoped friendship queries (PR #3), local recipient/key caches, persisted tab tracking, retry backoff, and alarm heartbeats below describe pending changes, not guarantees of current `main`. The comment-policy release gate is not configured in `main`.
+> This document describes the implemented trust boundaries and controls. Passing automated tests is not a security certification or proof of real-world session reliability. Manual multi-user browser testing and production deployment are separate release steps.
 
 ## Objectives
 
@@ -90,8 +90,7 @@ valid Firebase bearer token. Users can read only their own profile, requests, an
 mutations are derived from the authenticated UID rather than a client-supplied owner ID.
 
 D1 is the only friendship source of truth. Clients cannot write the Realtime Database friendship
-cache. The current Worker loads the full friendship graph for request-time synchronization.
-The pending scoped-synchronization change (PR #3) synchronizes only the affected nodes, using an indexed query
+cache. Request-time synchronization updates only the affected nodes, using an indexed query
 that loads just the friendships of those users. A presence-friends request heals the caller's own
 node in the background with `waitUntil`. The daily reconciliation replaces the complete cache, so
 unknown or stale edges are removed. OAuth reconnects also replace the complete cache, because they
@@ -113,8 +112,6 @@ Realtime Database rules require reciprocal friendship edges before a sender can 
 mailbox. A recipient may read and clear only their own mailbox. A sender may delete only their own
 outbound records. All other paths deny reads and writes.
 
-The following is the pending presence design, not current `main` behavior (which delays a channel
-publish by three seconds and uses background timers rather than alarms).
 A channel change is published immediately. Only one publish pass runs at a time, and the newest
 selection always wins. Records are refreshed when they are 25 seconds old and expire after 60
 seconds. Failed writes stay unconfirmed and are retried with backoff. A heartbeat alarm and
@@ -125,7 +122,6 @@ after the friendship has ended.
 
 ## Sessions
 
-The following describes the pending session-persistence change in PR #2.
 Only the background creates anonymous Firebase users. The Firebase credential is stored in the
 extension's IndexedDB through a persistence guard. The guard prevents the SDK from deleting the
 credential after transient restore errors. A credential that cannot be restored is replaced only

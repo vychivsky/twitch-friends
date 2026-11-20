@@ -1,6 +1,6 @@
 # Session persistence
 
-> Implementation status: the persistence guard and background session authority are proposed in [PR #2](https://github.com/vychivsky/twitch-friends/pull/2), not yet merged. Registration/friend caches, stored tab selection, and automatic one-minute background retries additionally depend on the unmerged presence refactor. This document is a design and code-path analysis, not proof of a reproduced production incident.
+> This document describes the implemented session guard, background authority, caches, and retry paths. The earlier session-loss analysis identifies possible failure paths; it does not prove the cause of every production logout. Browser and two-user acceptance testing remain separate release checks.
 
 This document explains how Twitch Friends keeps a user signed in across service-worker restarts,
 browser restarts, and extension updates. It also covers what can still end a session.
@@ -21,7 +21,7 @@ export it, including extension code. A hash could not restore it. The Firebase r
 stored by the Firebase SDK in the extension's own IndexedDB. Twitch web pages and content scripts
 cannot open that database, because content scripts use the page origin for IndexedDB.
 
-## Root cause of earlier session loss
+## Failure paths behind earlier session loss
 
 A changed Firebase UID can explain why a previously connected user must connect Twitch again. The following paths are risks identified in the earlier implementation, not a confirmed diagnosis for every production logout. The D1 mapping is keyed
 by UID, so a new UID looks like a user who never connected.
@@ -65,7 +65,7 @@ by UID, so a new UID looks like a user who never connected.
   replaced. A read error is surfaced and never causes a new key to be generated.
 - `src/features/presence/presenceSync.ts` caches the identity registration (UID and public key, for
   12 hours) and the friend list (30 minutes, plus change notifications). A restart therefore does
-  not call rate-limited Worker endpoints. Previously, frequent restarts could exhaust the
+  avoids rate-limited Worker endpoints while those caches remain valid. Previously, frequent restarts could exhaust the
   10-per-hour identity limit and leave presence stopped.
 
 ## Lifecycle
